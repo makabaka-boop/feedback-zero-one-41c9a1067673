@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "== 1/2 单元与端到端验收（38 项） =="
+echo "== 1/2 单元与端到端验收（59 项） =="
 python3 -I -m unittest discover -s tests -v
 
 echo

@@ -42,6 +42,19 @@ def zone(zid, outer, holes=None):
     return {"zone_id": zid, "outer_ring": outer, "holes": holes or []}
 
 
+def run_unc(samples, zones, radii):
+    """带定位误差半径的作业入口。"""
+    return process({"samples": samples, "zones": zones,
+                    "uncertainty_radii": radii})
+
+
+def unc_total(result, animal, zone_id, key):
+    """取某动物某保护区的 possible/certain 总时长与区间。"""
+    a = next(x for x in result["animals"] if x["animal_id"] == animal)
+    z = next(x for x in a["zones"] if x["zone_id"] == zone_id)
+    return frac(z[key]["total_duration"]), z[key]["intervals"]
+
+
 class CanonicalAndVariants(unittest.TestCase):
     """题面基准：(-1,1)->(7,1)，3 秒，穿过 [0,2]^2 停留 3/4 秒。"""
 
@@ -418,6 +431,283 @@ class InputAndGeometryValidation(unittest.TestCase):
             loads(text)
 
 
+class UncertaintyRadii(unittest.TestCase):
+    """定位误差半径：possible（方框至少一点在区内）与 certain（全部点在区内）。
+
+    每个时刻的可能位置是以定位点为中心、半径为半边长的闭合轴对齐正方形；
+    半径与中心均按相邻采样时刻线性插值；区域含外环及洞边界、排除洞内部。
+    """
+
+    HOLE_OUTER = [[0, 0], [10, 0], [10, 10], [0, 10]]
+
+    def test_box_encloses_zone_possible_only(self):
+        """方框包住整个保护区：possible 全程成立，certain 不成立。"""
+        result = run_unc(
+            [sample("elk", 0, 1, 1), sample("elk", 4, 1, 1)],
+            [zone("z", SQUARE)],
+            [5, 5],
+        )
+        td, _ = total(result, "elk", "z")
+        self.assertEqual(td, Fraction(4))          # 中心轨迹始终在区内
+        pt, piv = unc_total(result, "elk", "z", "possible")
+        self.assertEqual(pt, Fraction(4))          # 方框始终盖住整个区域
+        self.assertEqual(len(piv), 1)
+        self.assertEqual(frac(piv[0]["start"]), Fraction(0))
+        self.assertEqual(frac(piv[0]["end"]), Fraction(4))
+        ct, civ = unc_total(result, "elk", "z", "certain")
+        self.assertEqual(ct, Fraction(0))          # 方框远大于区域，不可能全在区内
+        self.assertEqual(civ, [])
+
+    def test_corners_inside_but_box_covers_hole_not_certain(self):
+        """角点均在区内却包住洞：certain 必须不成立（不能只查方框角点）。"""
+        hole = [[4, 4], [6, 4], [6, 6], [4, 6]]
+        result = run_unc(
+            [sample("a", 0, 5, 5), sample("a", 6, 5, 5)],
+            [zone("z", self.HOLE_OUTER, [hole])],
+            [3, 3],  # 方框 [2,8]^2：四角 (2,2)(8,2)(2,8)(8,8) 都在区域内
+        )
+        ct, civ = unc_total(result, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(0))          # 方框覆盖洞内部 => certain 失败
+        self.assertEqual(civ, [])
+        pt, _ = unc_total(result, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(6))          # 方框与区域有大片相交
+        td, _ = total(result, "a", "z")
+        self.assertEqual(td, Fraction(0))          # 中心点在洞内部，中心轨迹无停留
+
+    def test_brief_intersection_during_motion(self):
+        """运动中短暂相交：中心始终区外，方框扫过时 possible 短暂成立。"""
+        result = run_unc(
+            [sample("a", 0, -3, 3), sample("a", 10, 7, 3)],
+            [zone("z", SQUARE)],
+            [2, 2],
+        )
+        td, _ = total(result, "a", "z")
+        self.assertEqual(td, Fraction(0))          # 中心轨迹 y=3 在区外
+        pt, piv = unc_total(result, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(6))          # 方框 x 范围扫过 [0,2]：t∈[1,7]
+        self.assertEqual(len(piv), 1)
+        self.assertEqual(frac(piv[0]["start"]), Fraction(1))
+        self.assertEqual(frac(piv[0]["end"]), Fraction(7))
+        ct, _ = unc_total(result, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(0))          # 方框高 4 > 区域高 2，永不 certain
+
+    def test_nested_crossing_full_intervals(self):
+        """匀速穿越：certain ⊂ 中心轨迹 ⊂ possible 三层区间与时长全部核对。"""
+        big = [[0, 0], [10, 0], [10, 10], [0, 10]]
+        result = run_unc(
+            [sample("a", 0, -4, 5), sample("a", 18, 14, 5)],
+            [zone("z", big)],
+            [2, 2],
+        )
+        td, iv = total(result, "a", "z")
+        self.assertEqual(td, Fraction(10))         # 中心 x∈[0,10]：t∈[4,14]
+        self.assertEqual(frac(iv[0]["start"]), Fraction(4))
+        self.assertEqual(frac(iv[0]["end"]), Fraction(14))
+        pt, piv = unc_total(result, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(14))         # 方框触区：t∈[2,16]
+        self.assertEqual(len(piv), 1)
+        self.assertEqual(frac(piv[0]["start"]), Fraction(2))
+        self.assertEqual(frac(piv[0]["end"]), Fraction(16))
+        ct, civ = unc_total(result, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(6))          # 方框完全入内：t∈[6,12]
+        self.assertEqual(len(civ), 1)
+        self.assertEqual(frac(civ[0]["start"]), Fraction(6))
+        self.assertEqual(frac(civ[0]["end"]), Fraction(12))
+
+    def test_radius_grows_certain_shrinks(self):
+        """半径变化：0→3 线性增长，certain 区间随方框越界而截止。"""
+        z4 = [[0, 0], [4, 0], [4, 4], [0, 4]]
+        result = run_unc(
+            [sample("a", 0, 2, 2), sample("a", 3, 2, 2)],
+            [zone("z", z4)],
+            [0, 3],  # r(t)=t，方框 [2-t, 2+t]^2
+        )
+        ct, civ = unc_total(result, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(2))          # t≤2 时方框含于区域
+        self.assertEqual(frac(civ[0]["start"]), Fraction(0))
+        self.assertEqual(frac(civ[0]["end"]), Fraction(2))
+        pt, _ = unc_total(result, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(3))          # 中心始终在区内 => possible 全程
+        td, _ = total(result, "a", "z")
+        self.assertEqual(td, Fraction(3))
+
+    def test_radius_shrinks_to_zero_possible_vanishes(self):
+        """半径退化为零：6→0 线性收缩，方框与区域的相交随之消失。"""
+        z4 = [[0, 0], [4, 0], [4, 4], [0, 4]]
+        result = run_unc(
+            [sample("a", 0, 9, 9), sample("a", 6, 9, 9)],
+            [zone("z", z4)],
+            [6, 0],  # r(t)=6-t，方框 [3+t, 15-t]^2
+        )
+        pt, piv = unc_total(result, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(1))          # 仅 t∈[0,1] 方框触区
+        self.assertEqual(len(piv), 1)
+        self.assertEqual(frac(piv[0]["end"]), Fraction(1))
+        ct, _ = unc_total(result, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(0))
+        td, _ = total(result, "a", "z")
+        self.assertEqual(td, Fraction(0))          # 中心点 (9,9) 始终在区外
+
+    def test_merge_across_segments_and_isolated_certain_dropped(self):
+        """端点相接合并：两段 possible 在共享端点相接并合并；
+        仅单点成立的 certain（t=5 方框恰与区域重合）不产生区间。"""
+        result = run_unc(
+            [sample("a", 0, -4, 1), sample("a", 4, 0, 1), sample("a", 8, 4, 1)],
+            [zone("z", SQUARE)],
+            [1, 1, 1],
+        )
+        pt, piv = unc_total(result, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(4))          # [3,4] 与 [4,7] 端点相接合并
+        self.assertEqual(len(piv), 1)
+        self.assertEqual(frac(piv[0]["start"]), Fraction(3))
+        self.assertEqual(frac(piv[0]["end"]), Fraction(7))
+        ct, civ = unc_total(result, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(0))          # 孤立接触不产生区间
+        self.assertEqual(civ, [])
+        td, iv = total(result, "a", "z")
+        self.assertEqual(td, Fraction(2))          # 中心轨迹 [4,6]
+        self.assertEqual(len(iv), 1)
+
+    def test_zero_radii_match_center(self):
+        """半径全程退化为零：possible / certain 与中心轨迹完全一致。"""
+        result = run_unc(
+            [sample("a", 0, 0, 0), sample("a", 1, 1, 0), sample("a", 2, 2, 0)],
+            [zone("z", SQUARE)],
+            [0, 0, 0],
+        )
+        td, iv = total(result, "a", "z")
+        self.assertEqual(td, Fraction(2))          # 沿底边移动计时
+        for key in ("possible", "certain"):
+            kt, kiv = unc_total(result, "a", "z", key)
+            self.assertEqual(kt, Fraction(2))
+            self.assertEqual(len(kiv), 1)
+            self.assertEqual(frac(kiv[0]["start"]), Fraction(0))
+            self.assertEqual(frac(kiv[0]["end"]), Fraction(2))
+
+    def test_hole_boundary_touch_allowed_for_certain(self):
+        """方框贴外环边界与洞边界（边界属于区域）：certain 仍然成立。"""
+        hole = [[4, 4], [6, 4], [6, 6], [4, 6]]
+        result = run_unc(
+            [sample("a", 0, 2, 5), sample("a", 4, 2, 5)],
+            [zone("z", self.HOLE_OUTER, [hole])],
+            [2, 2],  # 方框 [0,4]×[3,7]：左贴外环、右贴洞边界
+        )
+        ct, _ = unc_total(result, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(4))
+        pt, _ = unc_total(result, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(4))
+        td, _ = total(result, "a", "z")
+        self.assertEqual(td, Fraction(4))
+
+    def test_box_inside_hole_interior_no_dwell(self):
+        """方框完全落入洞内部：possible 与 certain 均不成立。"""
+        hole = [[3, 3], [7, 3], [7, 7], [3, 7]]
+        result = run_unc(
+            [sample("a", 0, 5, 5), sample("a", 4, 5, 5)],
+            [zone("z", self.HOLE_OUTER, [hole])],
+            [1, 1],  # 方框 [4,6]^2 ⊂ 洞内部 (3,7)^2
+        )
+        for key in ("possible", "certain"):
+            kt, kiv = unc_total(result, "a", "z", key)
+            self.assertEqual(kt, Fraction(0))
+            self.assertEqual(kiv, [])
+        td, _ = total(result, "a", "z")
+        self.assertEqual(td, Fraction(0))
+
+    def test_single_point_animal_with_radii(self):
+        """单点动物无时长，但 possible / certain 组合保留。"""
+        result = run_unc(
+            [sample("lonely", 42, 1, 1)],
+            [zone("z", SQUARE)],
+            [3],
+        )
+        z = result["animals"][0]["zones"][0]
+        for key in ("possible", "certain"):
+            self.assertEqual(z[key]["intervals"], [])
+            self.assertEqual(frac(z[key]["total_duration"]), Fraction(0))
+
+    def test_output_compatible_without_radii(self):
+        """未提供数组时输出逐项兼容：不出现 possible / certain 字段。"""
+        result = run(
+            [sample("a", 0, -1, 1), sample("a", 3, 7, 1)],
+            [zone("z", SQUARE)],
+        )
+        for a in result["animals"]:
+            for z in a["zones"]:
+                self.assertEqual(
+                    sorted(z.keys()), ["intervals", "total_duration", "zone_id"])
+
+    def test_center_results_preserved_with_radii(self):
+        """提供半径时原中心轨迹结果逐项保留，仅追加 possible / certain。"""
+        samples = [sample("a", 0, -1, 1), sample("a", 3, 7, 1)]
+        zones = [zone("z", SQUARE)]
+        plain = run(samples, zones)
+        with_unc = run_unc(samples, zones, [1, 1])
+        z_plain = plain["animals"][0]["zones"][0]
+        z_unc = with_unc["animals"][0]["zones"][0]
+        self.assertEqual(z_unc["intervals"], z_plain["intervals"])
+        self.assertEqual(z_unc["total_duration"], z_plain["total_duration"])
+        # 半径 1 的方框：possible [0, 3/2]，certain 仅孤立点（无区间）
+        pt, piv = unc_total(with_unc, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(3, 2))
+        self.assertEqual(frac(piv[0]["start"]), Fraction(0))
+        self.assertEqual(frac(piv[0]["end"]), Fraction(3, 2))
+        ct, _ = unc_total(with_unc, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(0))
+
+    # ---------------- 输入校验：整次拒绝并定位下标 ----------------
+
+    def _expect_unc(self, payload, needle):
+        with self.assertRaises(GeoDwellError) as ctx:
+            process(payload)
+        self.assertIn(needle, str(ctx.exception))
+
+    def test_radii_length_mismatch_rejected(self):
+        self._expect_unc(
+            {"samples": [sample("a", 0, 0, 0), sample("a", 1, 1, 1)],
+             "zones": [zone("z", SQUARE)],
+             "uncertainty_radii": [1]},
+            "长度")
+
+    def test_radii_not_array_rejected(self):
+        for bad in (5, "x", None):
+            self._expect_unc(
+                {"samples": [sample("a", 0, 0, 0)],
+                 "zones": [zone("z", SQUARE)],
+                 "uncertainty_radii": bad},
+                "数组")
+
+    def test_radii_negative_rejected_locates_index(self):
+        self._expect_unc(
+            {"samples": [sample("a", 0, 0, 0), sample("a", 1, 1, 1),
+                         sample("a", 2, 2, 2)],
+             "zones": [zone("z", SQUARE)],
+             "uncertainty_radii": [0, 1, -2]},
+            "uncertainty_radii[2]")
+
+    def test_radii_boolean_rejected_locates_index(self):
+        self._expect_unc(
+            {"samples": [sample("a", 0, 0, 0), sample("a", 1, 1, 1)],
+             "zones": [zone("z", SQUARE)],
+             "uncertainty_radii": [1, True]},
+            "uncertainty_radii[1]")
+
+    def test_radii_out_of_i32_rejected(self):
+        self._expect_unc(
+            {"samples": [sample("a", 0, 0, 0)],
+             "zones": [zone("z", SQUARE)],
+             "uncertainty_radii": [2 ** 31]},
+            "uncertainty_radii[0]")
+
+    def test_radii_non_integer_rejected(self):
+        for bad in (1.5, "1", None):
+            self._expect_unc(
+                {"samples": [sample("a", 0, 0, 0)],
+                 "zones": [zone("z", SQUARE)],
+                 "uncertainty_radii": [bad]},
+                "uncertainty_radii[0]")
+
+
 class CliAtomicity(unittest.TestCase):
     """CLI 端到端：成功才整体替换，失败保持旧文件。"""
 
@@ -459,6 +749,39 @@ class CliAtomicity(unittest.TestCase):
         with open(self.out, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "OLD CONTENT")
         self.assertIn("面积为零", proc.stderr)
+
+    def test_bad_radii_keeps_old_output(self):
+        """非法 uncertainty_radii 整次拒绝，已有输出文件保持不变。"""
+        bad_radii = os.path.join(self.tmp, "bad_radii.json")
+        with open(bad_radii, "w", encoding="utf-8") as fh:
+            json.dump({"samples": [sample("a", 0, 0, 0), sample("a", 1, 1, 1)],
+                       "zones": [zone("z", SQUARE)],
+                       "uncertainty_radii": [1]}, fh)  # 长度不符
+        with open(self.out, "w", encoding="utf-8") as fh:
+            fh.write("OLD CONTENT")
+        proc = self._run(bad_radii, self.out)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("uncertainty_radii", proc.stderr)
+        with open(self.out, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "OLD CONTENT")
+
+    def test_success_with_uncertainty_radii(self):
+        """带半径的端到端：原中心结果保留，possible / certain 追加。"""
+        inp = os.path.join(self.tmp, "unc.json")
+        with open(inp, "w", encoding="utf-8") as fh:
+            json.dump({"samples": [sample("a", 0, -1, 1), sample("a", 3, 7, 1)],
+                       "zones": [zone("z", SQUARE)],
+                       "uncertainty_radii": [1, 1]}, fh)
+        proc = self._run(inp, self.out)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.out, encoding="utf-8") as fh:
+            data = json.load(fh)
+        td, _ = total(data, "a", "z")
+        self.assertEqual(td, Fraction(3, 4))       # 中心轨迹结果不变
+        pt, _ = unc_total(data, "a", "z", "possible")
+        self.assertEqual(pt, Fraction(3, 2))
+        ct, _ = unc_total(data, "a", "z", "certain")
+        self.assertEqual(ct, Fraction(0))
 
     def test_no_temp_files_left(self):
         self._run(self.good, self.out)

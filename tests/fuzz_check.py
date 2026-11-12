@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from geo_dwell.geometry import validate_zone
 from geo_dwell.clipping import clip_segment, zone_contains
 from geo_dwell.intervals import merge_intervals, total_duration
+from geo_dwell.uncertainty import (
+    uncertainty_pieces, _critical_params, _square_status)
 
 random.seed(20261112)
 
@@ -61,6 +63,74 @@ def reference_length(a, b, outer, holes, steps=4000):
         if zone_contains(pt, outer, holes):
             inside += 1
     return Fraction(inside, steps)
+
+
+def _merge_pieces(pieces):
+    """把参数区间列表排序并合并端点相接者（用于不同切分粒度间的比较）。"""
+    out = []
+    for lo, hi in sorted(pieces):
+        if out and lo == out[-1][1]:
+            out[-1][1] = hi
+        else:
+            out.append([lo, hi])
+    return [tuple(p) for p in out]
+
+
+def fuzz_uncertainty(rng, outer, holes):
+    """定位误差方框的交叉核对：
+
+    - 临界参数间状态恒定（随机抽样，防止遗漏临界事件）；
+    - certain ⟹ possible（抽样点与合并区间两个层面）；
+    - 半径单调性：方框更大则 possible 不减、certain 不增；
+    - 半径全零时 possible/certain 与中心轨迹裁剪结果一致。
+    """
+    for _ in range(6):
+        a = (rng.randint(-5, 45), rng.randint(-5, 45))
+        b = (rng.randint(-5, 45), rng.randint(-5, 45))
+        r0 = rng.randint(0, 6)
+        r1 = rng.randint(0, 6)
+        poss, cert = uncertainty_pieces(a, b, r0, r1, outer, holes)
+
+        # certain 的每段都必须被 possible 的某段覆盖。
+        pm = _merge_pieces(poss)
+        for clo, chi in _merge_pieces(cert):
+            if not any(plo <= clo and chi <= phi for plo, phi in pm):
+                raise AssertionError(f"certain 未被 possible 覆盖: "
+                                     f"a={a} b={b} r=({r0},{r1})")
+
+        # 临界参数之间状态恒定：每个开区间随机抽 3 点与中点比对。
+        cuts = sorted(_critical_params(a, b, r0, r1, (outer, *holes)))
+        for lo, hi in zip(cuts, cuts[1:]):
+            if lo == hi:
+                continue
+            mid = (lo + hi) / 2
+            ref = _square_status(a, b, r0, r1, mid, outer, holes)
+            for _ in range(3):
+                u = lo + (hi - lo) * Fraction(rng.randint(1, 999), 1000)
+                st = _square_status(a, b, r0, r1, u, outer, holes)
+                if st != ref:
+                    raise AssertionError(
+                        f"临界参数间状态不恒定: u={u} mid={mid} "
+                        f"a={a} b={b} r=({r0},{r1}) outer={outer} "
+                        f"holes={holes}")
+                if st[1] and not st[0]:
+                    raise AssertionError("抽样点 certain 真而 possible 假")
+
+        # 半径单调性：同一时刻方框更大，possible 不减、certain 不增。
+        u = Fraction(rng.randint(0, 1000), 1000)
+        p1, c1 = _square_status(a, b, r0, r1, u, outer, holes)
+        p2, c2 = _square_status(a, b, r0 + 2, r1 + 3, u, outer, holes)
+        if p2 < p1 or c2 > c1:
+            raise AssertionError("半径单调性被破坏")
+
+        # 半径全零退化为点：possible/certain 与中心轨迹裁剪一致。
+        if a != b:
+            exact = _merge_pieces(clip_segment(a, b, outer, holes))
+            zp, zc = uncertainty_pieces(a, b, 0, 0, outer, holes)
+            if _merge_pieces(zp) != exact or _merge_pieces(zc) != exact:
+                raise AssertionError(
+                    f"零半径退化不一致: a={a} b={b} "
+                    f"outer={outer} holes={holes}")
 
 
 def main():
@@ -120,8 +190,12 @@ def main():
         if total_duration(merged) != exact_len:
             raise AssertionError("合并自洽检查失败")
 
+        # 定位误差方框（possible/certain）交叉核对。
+        fuzz_uncertainty(rng, outer, holes)
+
     print(f"fuzz OK: {trials} 个有效随机用例全部通过"
-          f"（长度交叉核对、反转不变性、拆分不变性、合并自洽）")
+          f"（长度交叉核对、反转不变性、拆分不变性、合并自洽、"
+          f"误差方框恒定/单调/零半径退化）")
 
 
 if __name__ == "__main__":
